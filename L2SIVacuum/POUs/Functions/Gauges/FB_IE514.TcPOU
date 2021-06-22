@@ -1,0 +1,211 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.6">
+  <POU Name="FB_IE514" Id="{a97e2217-150d-4da1-935e-7cd0aee79bd0}" SpecialFunc="None">
+    <Declaration><![CDATA[(* This function is for the Hot Cathode IE514 connected to n IM540 *)
+(*This function provides ILK and Set Point Protection for the Hot Cathode*)
+FUNCTION_BLOCK FB_IE514 EXTENDS FB_GaugeBase
+VAR_IN_OUT
+		
+END_VAR
+VAR_INPUT
+		PG	:	ST_VG; 
+END_VAR
+VAR_OUTPUT
+	{attribute 'pytmc' := '
+    pv: 
+	'}
+	IG : ST_VG; 
+END_VAR
+VAR
+	rV	:	REAL;
+	timer:TON;
+	rMaxPressure	:	REAL := 7.5E-5; //Torr
+	rMinPressure	:	REAL := 7.5E-14; //Torr
+	
+	//rDefaultVAC_SP: REAL := 9E-3; // as per manual
+	
+	iTermBits: UINT := 30518 ; // The terminal's maximum value in bits default el3174 as per vacuum architecture
+	(*IOs to be linked*)
+	/// Controls and I/Os
+	i_iPRESS_R AT %I* :INT; // input Pressure // Link to analog Input
+	q_xHV_DIS AT %Q* : BOOL := True; // Disable Gauge High Voltage when True // 'TcLinkTo' (EL2794) ^Output
+	i_xHV_ON AT %I*	: BOOL; //  True when High Voltage is on  // 'TcLinkTo' (EL1124) ^Input
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[(* 6-xx-2021, Patrick Ayers *)
+(* This function will read the pressure from an IE514 gauge on an IM540. *)
+
+(*Soft IO Linking*)
+IO();
+
+(*Pressure readbacks*)
+// check no div by zero
+If (iTermBits=0) THEN iTermBits := 30518;END_IF
+rV := 10*INT_TO_REAL(IG.i_iPRESS_R)/iTermBits;
+
+//conversion
+IG.rPRESS := LREAL_TO_REAL(EXPT(10, rV));	//manual page 70 IM540 (Mode Full)
+
+(* Pressure gauge State checks *)
+IF (rV <=10) AND (rV>0) THEN
+	IG.eState := Valid; // normal
+ELSIF rV >= 0.18 AND rV <= 0.22 THEN 
+	IG.eState := ValidLo; //LO
+ELSIF rV > 9.6 AND rV<= 9.9 THEN
+	IG.eState := ValidHi; //HIGH
+ELSIF rV <= 0 THEN // 
+	IG.eState := GaugeDisconnected; //not on
+	IG.rPRESS :=rMinPressure;
+ELSE
+	IG.eState := PressInvalid; //other fault - could be no gauge, controller powering up etc
+	IG.rPRESS := 0;
+END_IF
+
+
+(* Ion Gauge Protection Functions *)
+(* If the PG pressure is greater than the VG.PRO_SP then the gauge is disabled *)
+(* If the PG pressure is less than the VG.PRO_SP then the gauge is enabled *)
+(* This FB also implements some hysteresis so the gauge doesn't have rapid power cycling while near the turn on boundary *)
+
+	IF (PG.rPRESS <= IG.rPRO_SP) THEN
+		 IG.q_xHV_DIS := NOT IG.xHV_SW;
+		 IG.xILKOk := TRUE;
+	ELSIF NOT IG.q_xHV_DIS AND timer.Q THEN
+		IF IG.rPRESS > (IG.rPRO_SP + IG.rHYS_PR) OR PG.rPRESS > (IG.rPRO_SP + IG.rHYS_PR) THEN
+		IG.q_xHV_DIS := TRUE;
+		IG.xHV_SW := FALSE;
+		END_IF
+	ELSE 
+		IG.q_xHV_DIS := TRUE;
+		IG.xHV_SW := FALSE;
+		IG.xILKOk := FALSE;
+ 	END_IF
+ 
+
+
+ 
+(* Pressure gauge OK checks *)
+IG.xPRESS_OK := (rV <=10) AND (rV>0);
+
+
+(* Setpoint evaluation *)
+IG.xAT_VAC := IG.xPRESS_OK AND IG.rPRESS < IG.rVAC_SP;
+
+
+(*Logger*)
+ACT_Logger();
+(*Soft IO Linking*)
+// check ethercat Diagnostics
+IO();
+(*Load or save the persistent variables*)
+ACT_Persistent();
+timer(IN:= NOT IG.q_xHV_DIS, PT:= T#2s);
+
+]]></ST>
+    </Implementation>
+    <Action Name="ACT_Logger" Id="{93c0ffae-3d88-4f57-bcab-883e3369b4b7}">
+      <Implementation>
+        <ST><![CDATA[// ILK logger
+IF (IG.xLog) THEN
+	IF NOT IG.xILKOk AND NOT IG.q_xHV_DIS THEN
+			fbLogger(sMsg:='Lost external interlock while gauge was on.', eSevr:=TcEventSeverity.Critical);  	
+	END_IF
+	
+	
+	// Log Action
+	tAction(CLK:=  IG.xHV_SW);
+	IF tAction.Q THEN fbLogger(sMsg:='Ion gauge commanded to switch on', eSevr:=TcEventSeverity.Info); END_IF
+	
+	
+	
+	//STATE Logger  
+	IF ePrevState <> IG.eState THEN
+		  CASE IG.eState OF
+			ValidHi:
+				fbLogger(sMsg:='Gauge pressure valid high.', eSevr:=TcEventSeverity.Info);
+			ValidLo:
+				fbLogger(sMsg:='Gauge pressure valid low.', eSevr:=TcEventSeverity.Info);
+			Valid:
+				fbLogger(sMsg:='Gauge pressure valid.', eSevr:=TcEventSeverity.Info);
+			GaugeDisconnected:
+				fbLogger(sMsg:='Gauge Disconnected.', eSevr:=TcEventSeverity.Critical);
+			PressInvalid:
+				fbLogger(sMsg:='Gauge pressure invalid.', eSevr:=TcEventSeverity.Warning);
+			OoR:
+				fbLogger(sMsg:='Gauge pressure out of range.', eSevr:=TcEventSeverity.Warning);
+			Starting:
+				fbLogger(sMsg:='Gauge starting.', eSevr:=TcEventSeverity.Info);
+		  END_CASE
+		  ePrevState := IG.eState;  
+	  END_IF
+END_IF
+  
+
+]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="ACT_Persistent" Id="{2a66a9ff-01b8-49fb-871d-7ce35c93e94a}">
+      <Implementation>
+        <ST><![CDATA[(*On first PLC pass, load the persistent value into the structrue variable*)
+IF (SUPER^.bRestorePersistentData) THEN
+	SUPER^.bRestorePersistentData	:= FALSE;
+	IF ( rVAC_SP <> 0) THEN
+		IG.rVAC_SP := rVAC_SP;
+	END_IF;
+	IF ( rPRO_SP <> 0) THEN
+		IG.rPRO_SP := rPRO_SP;
+	END_IF;
+	IF ( rHYS_PR <> 0) THEN
+		IG.rHYS_PR := rHYS_PR;
+	END_IF;
+END_IF
+(*Check if a new value has been written in the structure variable copy it to the persistent variable*)
+IF NOT (IG.rVAC_SP = rVAC_SP)  THEN
+	rVAC_SP := IG.rVAC_SP;
+END_IF;
+
+IF NOT (IG.rPRO_SP = rPRO_SP) THEN
+	rPRO_SP:= IG.rPRO_SP;
+END_IF;
+
+IF NOT (IG.rHYS_PR = rHYS_PR) THEN
+	rHYS_PR:= IG.rHYS_PR;
+END_IF;]]></ST>
+      </Implementation>
+    </Action>
+    <Action Name="IO" Id="{4897bdd3-d08c-4a6b-97a4-93b4dfae5b6f}">
+      <Implementation>
+        <ST><![CDATA[(*soft link inputs*)
+IG.i_iPRESS_R:=	i_iPRESS_R; 
+
+(*soft link outputs*)
+q_xHV_DIS := IG.q_xHV_DIS;
+
+IG.i_xHV_ON:= i_xHV_ON;
+
+IG.sPath := sPath;]]></ST>
+      </Implementation>
+    </Action>
+    <Method Name="M_AutoOn" Id="{cc08bfe3-bd1c-4a23-9af8-d5b33250dccb}">
+      <Declaration><![CDATA[METHOD M_AutoOn : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[this^.IG.q_xHV_DIS:= FALSE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_HVE" Id="{d8f6dfee-09b7-477a-9cc9-e4597a79fa5d}">
+      <Declaration><![CDATA[METHOD M_HVE : BOOL
+VAR_INPUT
+		enable:bool; // set to true to enable, false to disable;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+this^.IG.xHV_SW:= (enable);]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>
